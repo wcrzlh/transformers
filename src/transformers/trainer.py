@@ -231,6 +231,10 @@ if is_accelerate_available():
         load_fsdp_optimizer,
         save_fsdp_model,
         save_fsdp_optimizer,
+        load_hsdp_model,
+        load_hsdp_optimizer,
+        save_hsdp_model,
+        save_hsdp_optimizer,
     )
 
     DATA_SAMPLERS = [RandomSampler]
@@ -300,6 +304,7 @@ SCALER_NAME = "scaler.pt"
 OPTIMIZER_NAME_BIN = "optimizer.bin"
 SCHEDULER_NAME = "scheduler.pt"
 FSDP_MODEL_NAME = "pytorch_model_fsdp"
+HSDP_MODEL_NAME = "pytorch_model_hsdp"
 
 
 @requires(
@@ -590,6 +595,7 @@ class Trainer:
             or ((args.fp16_full_eval or args.bf16_full_eval) and not args.do_train)
             or self.is_fsdp_xla_enabled
             or self.is_fsdp_enabled
+            or self.is_hsdp_enabled
         ):
             self.place_model_on_device = False
 
@@ -668,11 +674,11 @@ class Trainer:
                     " `Trainer`. Make sure the lines `import torch_xla.core.xla_model as xm` and"
                     " `model.to(xm.xla_device())` is performed before the optimizer creation in your script."
                 )
-        if (self.is_fsdp_xla_enabled or self.is_fsdp_enabled) and (
+        if (self.is_fsdp_xla_enabled or self.is_fsdp_enabled or self.is_hsdp_enabled) and (
             self.optimizer is not None or self.lr_scheduler is not None
         ):
             raise RuntimeError(
-                "Passing `optimizers` is not allowed if PyTorch FSDP is enabled. "
+                "Passing `optimizers` is not allowed if PyTorch FSDP/HSDP is enabled. "
                 "You should subclass `Trainer` and override the `create_optimizer_and_scheduler` method."
             )
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
@@ -2413,11 +2419,12 @@ class Trainer:
             else:
                 DebugUnderflowOverflow(self.model)
 
-        delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
+        delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled or self.is_hsdp_enabled
 
         # Can't delay optimizer creation when using FSDP2: https://github.com/huggingface/accelerate/blob/3f636d626063ffcf9a337c7d3624d61b7d187d59/src/accelerate/accelerator.py#L1404
         is_fsdp2 = self.is_fsdp_enabled and (getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2)
-        if is_fsdp2:
+        is_hsdp = self.is_hsdp_enabled
+        if is_fsdp2 or is_hsdp:
             delay_optimizer_creation = False
 
         # We need to reset the scheduler, as its parameters may be different on subsequent calls
@@ -2453,7 +2460,7 @@ class Trainer:
         # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
         use_accelerator_prepare = model is self.model
 
-        if use_accelerator_prepare and self.is_fsdp_enabled:
+        if use_accelerator_prepare and (self.is_fsdp_enabled or self.is_hsdp_enabled):
             # In case of auto_find_batch_size=True
             # Remove FSDP wrapping from sub-models.
             self.model = unwrap_model(self.model, recursive=True)
@@ -2486,7 +2493,7 @@ class Trainer:
         else:
             self.optimizer = self.accelerator.prepare(self.optimizer)
 
-        if self.is_fsdp_enabled:
+        if self.is_fsdp_enabled or self.is_hsdp_enabled:
             self.model = self.model_wrapped = model
 
         # for the rest of this function `model` is the outside model, whether it was wrapped or not
@@ -2503,7 +2510,7 @@ class Trainer:
                 deepspeed_load_checkpoint(
                     self.model_wrapped, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model)
                 )
-            elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
+            elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled or self.is_hsdp_enabled:
                 self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
 
         # Check if saved optimizer or scheduler states exist
@@ -2896,6 +2903,16 @@ class Trainer:
             # this checks the FSDP state dict when `FULL_STATE_DICT` is used
             or os.path.isfile(os.path.join(resume_from_checkpoint, f"{FSDP_MODEL_NAME}.bin"))
         )
+        is_hsdp_ckpt = os.path.isdir(resume_from_checkpoint) and (
+            # this checks the FSDP state dict when `SHARDED_STATE_DICT` is used
+            any(
+                HSDP_MODEL_NAME in folder_name
+                for folder_name in os.listdir(resume_from_checkpoint)
+                if os.path.isdir(os.path.join(resume_from_checkpoint, folder_name))
+            )
+            # this checks the FSDP state dict when `FULL_STATE_DICT` is used
+            or os.path.isfile(os.path.join(resume_from_checkpoint, f"{HSDP_MODEL_NAME}.bin"))
+        )
         # if multiple adapters exist, they get saved in sub directories
         adapter_subdirs = (
             [
@@ -2914,6 +2931,9 @@ class Trainer:
         if is_fsdp_ckpt and not self.is_fsdp_enabled:
             raise ValueError(f"Checkpoint found at {resume_from_checkpoint} is only supported when using PyTorch FSDP")
 
+        if is_hsdp_ckpt and not self.is_hsdp_enabled:
+            raise ValueError(f"Checkpoint found at {resume_from_checkpoint} is only supported when using PyTorch HSDP")
+
         if not (
             any(
                 os.path.isfile(f)
@@ -2927,6 +2947,7 @@ class Trainer:
                 ]
             )
             or is_fsdp_ckpt
+            or is_hsdp_ckpt
             or adapter_subdirs
         ):
             raise ValueError(f"Can't find a valid checkpoint at {resume_from_checkpoint}")
@@ -2943,7 +2964,7 @@ class Trainer:
                     "yield to errors or unwanted behaviors."
                 )
 
-        if os.path.isfile(weights_file) or os.path.isfile(safe_weights_file) or is_fsdp_ckpt:
+        if os.path.isfile(weights_file) or os.path.isfile(safe_weights_file) or is_fsdp_ckpt or is_hsdp_ckpt:
             # If the model is on the GPU, it still works!
             if is_sagemaker_mp_enabled():
                 if os.path.isfile(os.path.join(resume_from_checkpoint, "user_content.pt")):
@@ -2972,6 +2993,14 @@ class Trainer:
                     self.accelerator,
                     model,
                     resume_from_checkpoint,
+                    **_get_fsdp_ckpt_kwargs(),
+                )
+            elif self.is_hsdp_enabled:
+                load_hsdp_model(
+                    self.accelerator.state.hsdp_plugin,
+                    self.accelerator,
+                    model,
+                    self.state.best_model_checkpoint,
                     **_get_fsdp_ckpt_kwargs(),
                 )
             else:
@@ -3046,6 +3075,14 @@ class Trainer:
         elif self.is_fsdp_enabled:
             load_result = load_fsdp_model(
                 self.accelerator.state.fsdp_plugin,
+                self.accelerator,
+                model,
+                self.state.best_model_checkpoint,
+                **_get_fsdp_ckpt_kwargs(),
+            )
+        elif self.is_hsdp_enabled:
+            load_result = load_hsdp_model(
+                self.accelerator.state.hsdp_plugin,
                 self.accelerator,
                 model,
                 self.state.best_model_checkpoint,
@@ -3467,6 +3504,14 @@ class Trainer:
             save_fsdp_optimizer(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
             )
+        elif self.is_hsdp_enabled:
+            # save hsdp specific ckpt for resuming from ckpt
+            save_hsdp_model(
+                self.accelerator.state.hsdp_plugin, self.accelerator, self.model, output_dir, **_get_fsdp_ckpt_kwargs()
+            )
+            save_hsdp_optimizer(
+                self.accelerator.state.hsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
+            )
         elif self.args.should_save:
             # deepspeed.save_checkpoint above saves model/optim/sched
             torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
@@ -3579,6 +3624,15 @@ class Trainer:
                     if self.is_fsdp_enabled:
                         load_fsdp_optimizer(
                             self.accelerator.state.fsdp_plugin,
+                            self.accelerator,
+                            self.optimizer,
+                            self.model,
+                            checkpoint,
+                            **_get_fsdp_ckpt_kwargs(),
+                        )
+                    elif self.is_hsdp_enabled:
+                        load_hsdp_optimizer(
+                            self.accelerator.state.hsdp_plugin,
                             self.accelerator,
                             self.optimizer,
                             self.model,
@@ -4207,6 +4261,11 @@ class Trainer:
                 state_dict = self.accelerator.get_state_dict(self.model)
                 if self.args.should_save:
                     self._save(output_dir, state_dict=state_dict)
+        elif self.is_hsdp_enabled:
+            if "FULL_STATE_DICT" in str(self.accelerator.state.hsdp_plugin.state_dict_type):
+                state_dict = self.accelerator.get_state_dict(self.model)
+                if self.args.should_save:
+                    self._save(output_dir, state_dict=state_dict)
         elif self.is_deepspeed_enabled:
             try:
                 state_dict = self.accelerator.get_state_dict(self.deepspeed)
@@ -4614,12 +4673,12 @@ class Trainer:
             model = (
                 self.accelerator.prepare(model)
                 if self.is_deepspeed_enabled
-                or (self.is_fsdp_enabled and self.accelerator.mixed_precision != "fp8" and not self.args.torch_compile)
+                or ((self.is_fsdp_enabled or self.is_hsdp_enabled) and self.accelerator.mixed_precision != "fp8" and not self.args.torch_compile)
                 else self.accelerator.prepare_model(model, evaluation_mode=True)
             )
             self.model_preparation_time = round(time.time() - start_time, 4)
 
-            if self.is_fsdp_enabled:
+            if self.is_fsdp_enabled or self.is_hsdp_enabled:
                 self.model = model
 
             # for the rest of this function `model` is the outside model, whether it was wrapped or not
@@ -5227,11 +5286,11 @@ class Trainer:
         if len(self.accelerator._models) == 0 and model is self.model:
             model = (
                 self.accelerator.prepare(model)
-                if self.is_deepspeed_enabled or self.is_fsdp_enabled
+                if self.is_deepspeed_enabled or self.is_fsdp_enabled or self.is_hsdp_enabled
                 else self.accelerator.prepare_model(model, evaluation_mode=True)
             )
 
-            if self.is_fsdp_enabled:
+            if self.is_fsdp_enabled or self.is_hsdp_enabled:
                 self.model = model
 
             # for the rest of this function `model` is the outside model, whether it was wrapped or not
@@ -5521,6 +5580,7 @@ class Trainer:
         # deepspeed and accelerate flags covering both trainer args and accelerate launcher
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.is_hsdp_enabled = getattr(self.accelerator.state, "hsdp_plugin", None) is not None
         self.is_tp_enabled = getattr(self.accelerator.state, "torch_tp_plugin", None) is not None
         # post accelerator creation setup
         if self.is_fsdp_enabled:
@@ -5533,6 +5593,16 @@ class Trainer:
                     "can't be set to True simultaneously. Please use FSDP's activation_checkpointing logic "
                     "when using FSDP."
                 )
+        if self.is_hsdp_enabled:
+            hsdp_plugin = self.accelerator.state.hsdp_plugin
+            for param in ["limit_all_gathers", "activation_checkpointing"]:
+                setattr(hsdp_plugin, param, self.args.hsdp_config.get(param, getattr(hsdp_plugin, param)))
+            if hsdp_plugin.activation_checkpointing and self.args.gradient_checkpointing:
+                raise ValueError(
+                    "The activation_checkpointing in FSDP config and the gradient_checkpointing in training arg "
+                    "can't be set to True simultaneously. Please use FSDP's activation_checkpointing logic "
+                    "when using FSDP."
+                )
 
         if self.is_deepspeed_enabled and getattr(self.args, "hf_deepspeed_config", None) is None:
             self.propagate_args_to_deepspeed()
@@ -5540,10 +5610,15 @@ class Trainer:
         # `save_only_model` can't be used with DeepSpeed/FSDP along with `load_best_model_at_end`
         if (
             self.args.save_only_model
-            and (self.is_deepspeed_enabled or self.is_fsdp_enabled)
+            and (self.is_deepspeed_enabled or self.is_fsdp_enabled or self.is_hsdp_enabled)
             and self.args.load_best_model_at_end
         ):
-            wrapper = "DeepSpeed" if self.is_deepspeed_enabled else "FSDP"
+            if self.is_deepspeed_enabled:
+                wrapper = "DeepSpeed"
+            elif self.is_hsdp_enabled:
+                wrapper = "HSDP"
+            else:
+                wrapper = "FSDP"
             raise ValueError(f"{wrapper} can't be used with `save_only_model` along with `load_best_model_at_end`.")
 
         # `auto_find_batch_size` isn't supported yet with DeepSpeed Zero-3
@@ -5561,6 +5636,13 @@ class Trainer:
             and "SHARDED_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type)
         ):
             raise ValueError("save_only_model option is not compatible with FSDP state dict type 'SHARDED_STATE_DICT'")
+        # hsdp
+        if (
+            self.args.save_only_model
+            and self.is_hsdp_enabled
+            and "SHARDED_STATE_DICT" in str(self.accelerator.state.hsdp_plugin.state_dict_type)
+        ):
+            raise ValueError("save_only_model option is not compatible with HSDP state dict type 'SHARDED_STATE_DICT'")
 
     def propagate_args_to_deepspeed(self, auto_find_batch_size=False):
         """

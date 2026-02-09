@@ -824,6 +824,7 @@ class TrainingArguments:
     _VALID_DICT_FIELDS = [
         "accelerator_config",
         "fsdp_config",
+        "hsdp_config",
         "deepspeed",
         "gradient_checkpointing_kwargs",
         "lr_scheduler_kwargs",
@@ -1260,6 +1261,46 @@ class TrainingArguments:
             "help": (
                 "This parameter is deprecated. Transformer layer class name (case-sensitive) to wrap, e.g,"
                 " `BertLayer`, `GPTJBlock`, `T5Block` .... (useful only when `fsdp` flag is passed)."
+            )
+        },
+    )
+    # hsdp
+    hsdp: Optional[Union[list[FSDPOption], str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Whether or not to use PyTorch Fully Sharded Data Parallel (FSDP) training (in distributed training"
+                " only). The base option should be `full_shard`, `shard_grad_op` or `no_shard` and you can add"
+                " CPU-offload to `full_shard` or `shard_grad_op` like this: full_shard offload` or `shard_grad_op"
+                " offload`. You can add auto-wrap to `full_shard` or `shard_grad_op` with the same syntax: full_shard"
+                " auto_wrap` or `shard_grad_op auto_wrap`."
+            ),
+        },
+    )
+    hsdp_min_num_params: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "This parameter is deprecated. FSDP's minimum number of parameters for Default Auto Wrapping. (useful"
+                " only when `hsdp` field is passed)."
+            )
+        },
+    )
+    hsdp_config: Optional[Union[dict[str, Any], str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Config to be used with FSDP (Pytorch Fully Sharded Data Parallel). The value is either a "
+                "hsdp json config file (e.g., `hsdp_config.json`) or an already loaded json file as `dict`."
+            )
+        },
+    )
+    hsdp_transformer_layer_cls_to_wrap: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "This parameter is deprecated. Transformer layer class name (case-sensitive) to wrap, e.g,"
+                " `BertLayer`, `GPTJBlock`, `T5Block` .... (useful only when `hsdp` flag is passed)."
             )
         },
     )
@@ -2041,6 +2082,137 @@ class TrainingArguments:
             os.environ[f"{prefix}CPU_RAM_EFFICIENT_LOADING"] = cpu_ram_efficient_loading
 
             os.environ[f"{prefix}USE_ORIG_PARAMS"] = str(self.fsdp_config.get("use_orig_params", "true")).lower()
+
+        # hsdp
+        if self.hsdp is None:
+            self.hsdp = []
+        elif self.hsdp is True:
+            self.hsdp = [FSDPOption.FULL_SHARD]
+        elif isinstance(self.hsdp, str):
+            self.hsdp = [FSDPOption(s) for s in self.hsdp.split()]
+
+        if self.hsdp == [FSDPOption.OFFLOAD]:
+            raise ValueError(
+                "`--hsdp offload` can't work on its own. It needs to be added to `--hsdp full_shard` or "
+                '`--hsdp shard_grad_op`. For example, `--hsdp "full_shard offload"`.'
+            )
+        elif FSDPOption.FULL_SHARD in self.hsdp and FSDPOption.SHARD_GRAD_OP in self.hsdp:
+            raise ValueError("`--hsdp full_shard` is not compatible with `--hsdp shard_grad_op`.")
+
+        if self.gradient_checkpointing and (
+            FSDPOption.FULL_SHARD in self.hsdp or FSDPOption.HYBRID_SHARD in self.hsdp
+        ):
+            logger.warning(
+                "When using FSDP full shard, instead of using `gradient_checkpointing` in TrainingArguments, please"
+                " use `activation_checkpointing` in `hsdp_config`. The former introduces a redundant AllGather"
+                " operation in backward pass. Reference: https://github.com/huggingface/transformers/issues/30404"
+            )
+
+        if self.hsdp_config is None:
+            self.hsdp_config = {}
+
+        if isinstance(self.hsdp_config, str):
+            if len(self.hsdp) == 0:
+                warnings.warn("`--hsdp_config` is useful only when `--hsdp` is specified.")
+            with open(self.hsdp_config, encoding="utf-8") as f:
+                self.hsdp_config = json.load(f)
+
+        if self.hsdp_config is not None and isinstance(self.hsdp_config, dict):
+            for k in list(self.hsdp_config.keys()):
+                if k.startswith("hsdp_"):
+                    v = self.hsdp_config.pop(k)
+                    self.hsdp_config[k[5:]] = v
+
+        if self.hsdp_min_num_params > 0:
+            warnings.warn("using `--hsdp_min_num_params` is deprecated. Use hsdp_config instead ", FutureWarning)
+
+        self.hsdp_config["min_num_params"] = max(self.hsdp_config.get("min_num_params", 0), self.hsdp_min_num_params)
+
+        # if hsdp_config["transformer_layer_cls_to_wrap"] is specified as a string, convert it to a list with a single object
+        if isinstance(self.hsdp_config.get("transformer_layer_cls_to_wrap", None), str):
+            self.hsdp_config["transformer_layer_cls_to_wrap"] = [self.hsdp_config["transformer_layer_cls_to_wrap"]]
+
+        if self.hsdp_transformer_layer_cls_to_wrap is not None:
+            warnings.warn(
+                "using `--hsdp_transformer_layer_cls_to_wrap` is deprecated. Use hsdp_config instead ", FutureWarning
+            )
+            self.hsdp_config["transformer_layer_cls_to_wrap"] = self.hsdp_config.get(
+                "transformer_layer_cls_to_wrap", []
+            ) + [self.hsdp_transformer_layer_cls_to_wrap]
+
+        if len(self.hsdp) == 0 and self.hsdp_config["min_num_params"] > 0:
+            warnings.warn("`min_num_params` is useful only when `--hsdp` is specified.")
+
+        if len(self.hsdp) == 0 and self.hsdp_config.get("transformer_layer_cls_to_wrap", None) is not None:
+            warnings.warn("`transformer_layer_cls_to_wrap` is useful only when `--hsdp` is specified.")
+
+        if (
+            len(self.hsdp) > 0
+            and self.hsdp_config["min_num_params"] > 0
+            and self.hsdp_config.get("transformer_layer_cls_to_wrap", None) is not None
+        ):
+            raise ValueError("`min_num_params` and `transformer_layer_cls_to_wrap` are mutually exclusive.")
+        self.hsdp_config["xla"] = self.hsdp_config.get("xla", False)
+        self.hsdp_config["xla_hsdp_v2"] = self.hsdp_config.get("xla_hsdp_v2", False)
+        self.hsdp_config["xla_hsdp_grad_ckpt"] = self.hsdp_config.get("xla_hsdp_grad_ckpt", False)
+        if self.hsdp_config["xla"]:
+            if len(self.hsdp) > 0:
+                # store XLA hsdp configuration parameters into a dictionary
+                # Copy the config to avoid modifying the original config (which may be used for JSON serialization)
+                self.xla_hsdp_config = self.hsdp_config.get("xla_hsdp_settings", {}).copy()
+                # apply appropriate string to torch.dtype conversions for parameters
+                if "compute_dtype" in self.xla_hsdp_config:
+                    self.xla_hsdp_config["compute_dtype"] = getattr(torch, self.xla_hsdp_config["compute_dtype"])
+                if "buffer_dtype" in self.xla_hsdp_config:
+                    self.xla_hsdp_config["buffer_dtype"] = getattr(torch, self.xla_hsdp_config["buffer_dtype"])
+            else:
+                warnings.warn("XLA FSDP can be used only when `--hsdp` is specified.")
+        else:
+            if self.hsdp_config["xla_hsdp_grad_ckpt"]:
+                warnings.warn("`--xla_hsdp_grad_ckpt` is useful only when `--xla` is set to true.")
+
+        # accelerate integration for FSDP
+        if len(self.hsdp) > 0 and not self.hsdp_config["xla"]:
+            os.environ["ACCELERATE_USE_FSDP"] = "true"
+            from accelerate.utils.constants import (
+                FSDP_AUTO_WRAP_POLICY,
+                FSDP_SHARDING_STRATEGY,
+            )
+
+            prefix = "HSDP_"
+            for hsdp_option in self.hsdp:
+                if hsdp_option.upper() in FSDP_SHARDING_STRATEGY:
+                    # set environment variable for FSDP sharding strategy
+                    os.environ[f"{prefix}SHARDING_STRATEGY"] = str(
+                        FSDP_SHARDING_STRATEGY.index(hsdp_option.upper()) + 1
+                    )
+                elif hsdp_option == FSDPOption.OFFLOAD:
+                    os.environ[f"{prefix}OFFLOAD_PARAMS"] = "true"
+                elif hsdp_option == FSDPOption.AUTO_WRAP:
+                    os.environ[f"{prefix}AUTO_WRAP_POLICY"] = FSDP_AUTO_WRAP_POLICY[0]
+                    if self.hsdp_config["min_num_params"] > 0:
+                        os.environ[f"{prefix}MIN_NUM_PARAMS"] = str(self.hsdp_config["min_num_params"])
+                        os.environ[f"{prefix}AUTO_WRAP_POLICY"] = FSDP_AUTO_WRAP_POLICY[1]
+                    elif self.hsdp_config.get("transformer_layer_cls_to_wrap", None) is not None:
+                        os.environ[f"{prefix}TRANSFORMER_CLS_TO_WRAP"] = ",".join(
+                            self.hsdp_config["transformer_layer_cls_to_wrap"]
+                        )
+            prefetch_policy = self.hsdp_config.get("backward_prefetch", "NO_PREFETCH")
+            os.environ[f"{prefix}BACKWARD_PREFETCH"] = prefetch_policy.upper()
+            os.environ[f"{prefix}FORWARD_PREFETCH"] = str(self.hsdp_config.get("forward_prefetch", "false")).lower()
+
+            sync_module_states = str(self.hsdp_config.get("sync_module_states", "true")).lower()
+            cpu_ram_efficient_loading = str(self.hsdp_config.get("cpu_ram_efficient_loading", "false")).lower()
+
+            if sync_module_states == "false" and cpu_ram_efficient_loading == "true":
+                # In this case, all the processes except the main process would have random weights leading
+                # to unexpected behaviour during training, thus throwing error here to prevent it.
+                raise ValueError('`sync_module_states` must be `"True"` if `cpu_ram_efficient_loading` is `"True"`')
+
+            os.environ[f"{prefix}SYNC_MODULE_STATES"] = sync_module_states
+            os.environ[f"{prefix}CPU_RAM_EFFICIENT_LOADING"] = cpu_ram_efficient_loading
+
+            os.environ[f"{prefix}USE_ORIG_PARAMS"] = str(self.hsdp_config.get("use_orig_params", "true")).lower()
 
         if self.tpu_metrics_debug:
             warnings.warn(
