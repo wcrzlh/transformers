@@ -77,40 +77,17 @@ class OpenPanguVLRMSNorm(nn.Module):
 
 
 class OpenPanguVLVisionRotaryEmbedding(nn.Module):
-    inv_freq_t: torch.Tensor
-    inv_freq_h: torch.Tensor
-    inv_freq_w: torch.Tensor
+    inv_freq: torch.Tensor
 
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
-        section_sizes = self._compute_section_sizes(dim // 2)
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        self.section_sizes = section_sizes
-        self.register_buffer("inv_freq_t", self._build_inv_freq(section_sizes[0], theta), persistent=False)
-        self.register_buffer("inv_freq_h", self._build_inv_freq(section_sizes[1], theta), persistent=False)
-        self.register_buffer("inv_freq_w", self._build_inv_freq(section_sizes[2], theta), persistent=False)
-
-    @staticmethod
-    def _compute_section_sizes(half_dim: int) -> tuple[int, int, int]:
-        base_size = half_dim // 3
-        remainder = half_dim % 3
-        section_sizes = [base_size, base_size, base_size]
-        for idx in range(remainder):
-            section_sizes[idx] += 1
-        return tuple(section_sizes)
-
-    @staticmethod
-    def _build_inv_freq(section_size: int, theta: float) -> torch.Tensor:
-        if section_size == 0:
-            return torch.empty(0, dtype=torch.float)
-        return 1.0 / (theta ** (torch.arange(section_size, dtype=torch.float) / section_size))
-
-    def forward(self, positions: torch.Tensor) -> torch.Tensor:
-        positions = positions.float()
-        freqs_t = positions[..., 0:1] * self.inv_freq_t if self.inv_freq_t.numel() > 0 else positions[..., :0]
-        freqs_h = positions[..., 1:2] * self.inv_freq_h if self.inv_freq_h.numel() > 0 else positions[..., :0]
-        freqs_w = positions[..., 2:3] * self.inv_freq_w if self.inv_freq_w.numel() > 0 else positions[..., :0]
-        return torch.cat((freqs_t, freqs_h, freqs_w, freqs_t, freqs_h, freqs_w), dim=-1)
+    def forward(self, seqlen: int) -> torch.Tensor:
+        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(seq, self.inv_freq)
+        return freqs
 
 
 class OpenPanguVLVisionPatchEmbed(nn.Module):
@@ -127,7 +104,7 @@ class OpenPanguVLVisionPatchEmbed(nn.Module):
             self.embed_dim,
             kernel_size=kernel_size,
             stride=kernel_size,
-            bias=True,
+            bias=False,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -210,10 +187,10 @@ class OpenPanguVLVisionAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = self.dim // self.num_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.q_proj = nn.Linear(self.dim, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(self.dim, self.num_key_value_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(self.dim, self.num_key_value_heads * self.head_dim, bias=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.dim, bias=True)
+        self.qkv = nn.Linear(
+            self.dim, self.num_key_value_heads * (self.num_key_value_groups + 2) * self.head_dim, bias=True
+        )
+        self.proj = nn.Linear(self.num_heads * self.head_dim, self.dim, bias=True)
         self.scaling = self.head_dim**-0.5
         self.config = config
         self.attention_dropout = 0.0
@@ -228,9 +205,15 @@ class OpenPanguVLVisionAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        query_states = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, self.head_dim)
-        key_states = self.k_proj(hidden_states).reshape(seq_length, self.num_key_value_heads, self.head_dim)
-        value_states = self.v_proj(hidden_states).reshape(seq_length, self.num_key_value_heads, self.head_dim)
+        qkv_states = (
+            self.qkv(hidden_states)
+            .reshape(seq_length, self.num_key_value_heads, self.num_key_value_groups + 2, self.head_dim)
+            .permute(2, 0, 1, 3)
+        )
+        qkv_states = qkv_states.unbind(0)
+        query_states = torch.cat(qkv_states[: self.num_key_value_groups], dim=1)
+        key_states = qkv_states[self.num_key_value_groups]
+        value_states = qkv_states[self.num_key_value_groups + 1]
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
@@ -279,10 +262,10 @@ class OpenPanguVLVisionAttention(nn.Module):
                 )[0]
                 for q, k, v in zip(*splits)
             ]
-            attn_output = torch.cat(attn_outputs, dim=1)
+        attn_output = torch.cat(attn_outputs, dim=1)
 
         attn_output = attn_output.reshape(seq_length, -1).contiguous()
-        return self.o_proj(attn_output)
+        return self.proj(attn_output)
 
 
 class OpenPanguVLVisionPatchMerger(nn.Module):
@@ -395,30 +378,36 @@ class OpenPanguVLVisionModel(OpenPanguVLPreTrainedModel):
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
+        max_hw = int(grid_thw[:, 1:].max().item())
+        freq_table = self.rotary_pos_emb(max_hw)
+        device = freq_table.device
+
         total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
-        positions = torch.empty((total_tokens, 3), dtype=torch.long, device=grid_thw.device)
+        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
 
         offset = 0
         for num_frames, height, width in grid_thw:
             merged_h, merged_w = height // merge_size, width // merge_size
-            block_rows = torch.arange(merged_h, device=grid_thw.device)
-            block_cols = torch.arange(merged_w, device=grid_thw.device)
-            intra_row = torch.arange(merge_size, device=grid_thw.device)
-            intra_col = torch.arange(merge_size, device=grid_thw.device)
+            block_rows = torch.arange(merged_h, device=device)
+            block_cols = torch.arange(merged_w, device=device)
+            intra_row = torch.arange(merge_size, device=device)
+            intra_col = torch.arange(merge_size, device=device)
 
             row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
             col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
             row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
             col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
 
-            frame_idx = torch.arange(num_frames, device=grid_thw.device)[:, None].expand(num_frames, row_idx.shape[0])
-            coords = torch.stack((frame_idx.reshape(-1), row_idx.repeat(num_frames), col_idx.repeat(num_frames)), dim=-1)
+            coords = torch.stack((row_idx, col_idx), dim=-1)
+            if num_frames > 1:
+                coords = coords.repeat(num_frames, 1)
 
             num_tokens = coords.shape[0]
-            positions[offset : offset + num_tokens] = coords
+            pos_ids[offset : offset + num_tokens] = coords
             offset += num_tokens
 
-        return self.rotary_pos_emb(positions)
+        embeddings = freq_table[pos_ids]
+        return embeddings.flatten(1)
     def get_window_index(self, grid_thw):
         window_index = []
         cu_window_seqlens = [0]
