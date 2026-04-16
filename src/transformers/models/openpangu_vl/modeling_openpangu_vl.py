@@ -129,6 +129,16 @@ class OpenPanguVLVisionMLP(nn.Module):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
 
 
+class OpenPanguVLProjectionSingle(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, bias: bool = True) -> None:
+        super().__init__()
+        self.act = nn.GELU()
+        self.linear = nn.Linear(input_dim, output_dim, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.linear(self.act(hidden_states))
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -184,13 +194,10 @@ class OpenPanguVLVisionAttention(nn.Module):
         super().__init__()
         self.dim = config.hidden_size
         self.num_heads = config.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = self.dim // self.num_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.qkv = nn.Linear(
-            self.dim, self.num_key_value_heads * (self.num_key_value_groups + 2) * self.head_dim, bias=True
-        )
-        self.proj = nn.Linear(self.num_heads * self.head_dim, self.dim, bias=True)
+        self.num_key_value_groups = 1
+        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=True)
+        self.proj = nn.Linear(self.dim, self.dim, bias=True)
         self.scaling = self.head_dim**-0.5
         self.config = config
         self.attention_dropout = 0.0
@@ -205,16 +212,9 @@ class OpenPanguVLVisionAttention(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        qkv_states = (
-            self.qkv(hidden_states)
-            .reshape(seq_length, self.num_key_value_heads, self.num_key_value_groups + 2, self.head_dim)
-            .permute(2, 0, 1, 3)
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
-        qkv_states = qkv_states.unbind(0)
-        query_states = torch.cat(qkv_states[: self.num_key_value_groups], dim=1)
-        key_states = qkv_states[self.num_key_value_groups]
-        value_states = qkv_states[self.num_key_value_groups + 1]
-
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
@@ -506,40 +506,17 @@ class OpenPanguVLModel(Qwen3VLModel):
         super().__init__(config)
         self.visual = OpenPanguVLVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3VLTextModel._from_config(config.text_config)
-        self.mhc_visual_expand_linear = config.vision_config.mhc_visual_expand_linear
-        self.mhc_num_stream = config.vision_config.mhc_num_stream
-
-        visual_in_dim = config.vision_config.out_hidden_size
-        expanded_dim = visual_in_dim * self.mhc_num_stream if self.mhc_visual_expand_linear else visual_in_dim
-        text_hidden_size = config.text_config.hidden_size
         projector_bias = bool(config.vision_config.projector.get("bias", True))
-
-        # Projection block required by OpenPangu-VL before MHC expansion.
-        self.pre_llm_visual_projection = nn.Sequential(
-            nn.Linear(visual_in_dim, visual_in_dim, bias=projector_bias),
-            nn.GELU(),
+        self.visual_projection = OpenPanguVLProjectionSingle(
+            config.vision_config.out_hidden_size, config.text_config.hidden_size, bias=projector_bias
         )
-        self.pre_llm_visual_expand = (
-            nn.Linear(visual_in_dim, expanded_dim, bias=projector_bias) if self.mhc_visual_expand_linear else None
-        )
-        self.pre_llm_visual_align = (
-            nn.Linear(expanded_dim, text_hidden_size, bias=projector_bias) if expanded_dim != text_hidden_size else None
-        )
-
-    def _project_visual_before_llm(self, visual_embeds: torch.Tensor) -> torch.Tensor:
-        visual_embeds = self.pre_llm_visual_projection(visual_embeds)
-        if self.pre_llm_visual_expand is not None:
-            visual_embeds = self.pre_llm_visual_expand(visual_embeds)
-        if self.pre_llm_visual_align is not None:
-            visual_embeds = self.pre_llm_visual_align(visual_embeds)
-        return visual_embeds
 
     def get_image_features(self, pixel_values: torch.FloatTensor, image_grid_thw: Optional[torch.LongTensor] = None):
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
         image_embeds = torch.split(image_embeds, split_sizes)
-        image_embeds = tuple(self._project_visual_before_llm(emb) for emb in image_embeds)
+        image_embeds = tuple(self.visual_projection(emb) for emb in image_embeds)
         return image_embeds, []
 
     def get_video_features(
