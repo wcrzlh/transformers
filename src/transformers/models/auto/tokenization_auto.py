@@ -519,6 +519,8 @@ TOKENIZER_MAPPING_NAMES = OrderedDict[str, tuple[Optional[str], Optional[str]]](
         ("opt", ("GPT2Tokenizer", "GPT2TokenizerFast" if is_tokenizers_available() else None)),
         ("owlv2", ("CLIPTokenizer", "CLIPTokenizerFast" if is_tokenizers_available() else None)),
         ("owlvit", ("CLIPTokenizer", "CLIPTokenizerFast" if is_tokenizers_available() else None)),
+        ("openpangu_vl", ("OpenPanguTokenizer" if is_sentencepiece_available() else None, None)),
+        ("openpangu_vl_text", ("OpenPanguTokenizer" if is_sentencepiece_available() else None, None)),
         ("paligemma", ("LlamaTokenizer", "LlamaTokenizerFast" if is_tokenizers_available() else None)),
         ("parakeet", ("ParakeetCTCTokenizer", None)),
         (

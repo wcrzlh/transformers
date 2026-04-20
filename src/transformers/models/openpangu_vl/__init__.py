@@ -19,7 +19,11 @@ from ...utils.import_utils import define_import_structure
 
 if TYPE_CHECKING:
     from .configuration_openpangu_vl import *
+    from .image_processing_openpangu_vl import *
     from .modeling_openpangu_vl import *
+    from .processing_openpangu_vl import *
+    from .tokenization_openpangu import *
+    from .video_processing_openpangu_vl import *
 else:
     import sys
 
