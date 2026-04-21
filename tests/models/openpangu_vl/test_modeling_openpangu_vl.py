@@ -282,19 +282,16 @@ class OpenPanguVLModelTest(unittest.TestCase):
         model = OpenPanguVLForConditionalGeneration(config).to(torch_device).float()
         model.eval()
 
+        hidden_states = torch.randn(1, input_ids.shape[1], config.text_config.hidden_size, device=torch_device)
         mock_outputs = SimpleNamespace(
-            loss=None,
-            logits=torch.randn(1, input_ids.shape[1], config.text_config.vocab_size, device=torch_device),
+            last_hidden_state=hidden_states,
             past_key_values=None,
             hidden_states=None,
             attentions=None,
             rope_deltas=None,
         )
 
-        with patch(
-            "transformers.models.openpangu_vl.modeling_openpangu_vl.Qwen3VLForConditionalGeneration.forward",
-            return_value=mock_outputs,
-        ):
+        with patch.object(model.model, "forward", return_value=mock_outputs):
             with torch.no_grad():
                 outputs = model(
                     input_ids=input_ids,
