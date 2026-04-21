@@ -15,9 +15,13 @@
 
 import copy
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from transformers import OpenPanguVLConfig, OpenPanguVLForConditionalGeneration, OpenPanguVLModel, is_torch_available
 from transformers.testing_utils import require_torch, torch_device
+from transformers.models.openpangu_vl.modeling_openpangu_vl import OpenPanguVLVisionModel
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import floats_tensor, ids_tensor
@@ -176,3 +180,128 @@ class OpenPanguVLModelTest(unittest.TestCase):
                 image_features=matching_image_features,
             )
             self.assertEqual(image_mask[..., 0].sum().item(), 1)
+
+    def _get_regular_multimodal_inputs(self):
+        config = copy.deepcopy(self.model_tester.get_config())
+        patch_size = config.vision_config.patch_size
+        temporal_patch_size = config.vision_config.temporal_patch_size
+        pixel_values = floats_tensor([4, 3 * (patch_size**2) * temporal_patch_size]).to(torch_device, dtype=torch.float32)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=torch_device)
+        input_ids = torch.tensor(
+            [
+                [
+                    config.text_config.bos_token_id,
+                    17,
+                    21,
+                    self.model_tester.vision_start_token_id,
+                    self.model_tester.image_token_id,
+                    self.model_tester.image_token_id,
+                    self.model_tester.image_token_id,
+                    self.model_tester.image_token_id,
+                    self.model_tester.vision_end_token_id,
+                    33,
+                    config.text_config.eos_token_id,
+                    config.text_config.pad_token_id,
+                ]
+            ],
+            device=torch_device,
+        )
+        attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]], device=torch_device)
+        return config, pixel_values, image_grid_thw, input_ids, attention_mask
+
+    def test_model_forward_with_regular_image_inputs(self):
+        config, pixel_values, image_grid_thw, input_ids, attention_mask = self._get_regular_multimodal_inputs()
+        model = OpenPanguVLModel(config).to(torch_device).float()
+        model.eval()
+
+        image_embeds = torch.randn(4, config.text_config.hidden_size, device=torch_device)
+        mock_outputs = SimpleNamespace(
+            last_hidden_state=torch.randn(1, input_ids.shape[1], config.text_config.hidden_size, device=torch_device),
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+            rope_deltas=None,
+        )
+
+        with patch.object(model, "get_image_features", return_value=((image_embeds,), [])) as mocked_get_image_features:
+            with patch.object(model.language_model, "forward", return_value=mock_outputs):
+                with torch.no_grad():
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                    )
+
+        mocked_get_image_features.assert_called_once()
+        self.assertEqual(outputs.__class__.__name__, "OpenPanguVLModelOutputWithPast")
+        self.assertEqual(outputs.last_hidden_state.shape, (1, input_ids.shape[1], config.text_config.hidden_size))
+
+    def test_text_model_forward_with_regular_inputs(self):
+        config, _, _, input_ids, attention_mask = self._get_regular_multimodal_inputs()
+        model = OpenPanguVLModel(config).to(torch_device).float()
+        text_model = model.language_model
+        text_model.eval()
+
+        with ExitStack() as stack:
+            for layer in text_model.layers:
+                stack.enter_context(patch.object(layer, "forward", side_effect=lambda hidden_states, **kwargs: hidden_states))
+
+            with torch.no_grad():
+                outputs = text_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+
+        self.assertEqual(outputs.last_hidden_state.shape, (1, input_ids.shape[1], config.text_config.hidden_size))
+
+    def test_vision_model_forward_with_regular_inputs(self):
+        config = copy.deepcopy(self.model_tester.get_config())
+        config.vision_config.depth = 0
+        config.vision_config.num_layers = 0
+
+        vision_model = OpenPanguVLVisionModel._from_config(config.vision_config).to(torch_device).float()
+        vision_model.eval()
+
+        patch_size = config.vision_config.patch_size
+        temporal_patch_size = config.vision_config.temporal_patch_size
+        pixel_values = floats_tensor([4, 3 * (patch_size**2) * temporal_patch_size]).to(torch_device, dtype=torch.float32)
+        image_grid_thw = torch.tensor([[1, 2, 2]], device=torch_device)
+
+        with patch.object(vision_model.merger, "forward", side_effect=lambda hidden_states: hidden_states):
+            with torch.no_grad():
+                outputs = vision_model(
+                    hidden_states=pixel_values,
+                    grid_thw=image_grid_thw,
+                )
+
+        self.assertEqual(outputs.shape, (4, config.vision_config.hidden_size))
+
+    def test_conditional_generation_forward_with_regular_image_inputs(self):
+        config, pixel_values, image_grid_thw, input_ids, attention_mask = self._get_regular_multimodal_inputs()
+        model = OpenPanguVLForConditionalGeneration(config).to(torch_device).float()
+        model.eval()
+
+        mock_outputs = SimpleNamespace(
+            loss=None,
+            logits=torch.randn(1, input_ids.shape[1], config.text_config.vocab_size, device=torch_device),
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+            rope_deltas=None,
+        )
+
+        with patch(
+            "transformers.models.openpangu_vl.modeling_openpangu_vl.Qwen3VLForConditionalGeneration.forward",
+            return_value=mock_outputs,
+        ):
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                )
+
+        self.assertEqual(outputs.__class__.__name__, "OpenPanguVLCausalLMOutputWithPast")
+        self.assertEqual(outputs.logits.shape, (1, input_ids.shape[1], config.text_config.vocab_size))
