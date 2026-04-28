@@ -1,11 +1,12 @@
 import torch
 from torch import nn
 
+
 class mHCModule(nn.Module):
     def __init__(
-            self,
-            config: OpenPanguV2Config,
-            merge_layer_only_pre=False,
+        self,
+        config,
+        merge_layer_only_pre=False,
     ):
         super().__init__()
         self.num_stream = config.mhc_num_stream
@@ -27,7 +28,7 @@ class mHCModule(nn.Module):
             self.hidden_size * self.num_stream,
             phi_output_hiden_size,
             bias=False,
-            dtype=torch.bfloat16
+            dtype=torch.bfloat16,
         )
         self.mhc_use_gamma = config.mhc_use_gamma
         self.hc_eps = 1e-6
@@ -35,7 +36,6 @@ class mHCModule(nn.Module):
         self.mhc_recur_norm = config.mhc_recur_norm
         if self.mhc_use_gamma:
             self.norm_gamma = nn.Parameter(torch.empty(self.hidden_size * self.num_stream, dtype=torch.bfloat16))
-
 
     def hc_pre(self, x):
         dtype = x.dtype
@@ -47,17 +47,19 @@ class mHCModule(nn.Module):
 
         h_pre, h_post, h_res = self.hc_split_sinkhorn_torch(weight)
 
-        y = torch.sum(h_pre.unsqueeze(-1) * x.unflatten(dim=-1, sizes=(self.num_stream, -1)), dim=2)
+        hidden_streams = x.unflatten(dim=-1, sizes=(self.num_stream, -1))
+        y = torch.sum(h_pre.unsqueeze(-1) * hidden_streams, dim=-2)
         return y.to(dtype), h_post, h_res
 
     def hc_post(self, x, residual, h_post, h_res):
         if self.merge_layer_only_pre:
             return x
 
-        y = h_post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
-            h_res.unsqueeze(-1) * residual.unflatten(dim=-1, sizes=(self.num_stream, -1)).unsqueeze(-2), dim=-3
-        )
-        return y.view(residual.shape).type_as(x)
+        residual_shape = residual.shape
+        hidden_streams = residual.unflatten(dim=-1, sizes=(self.num_stream, -1))
+        residual_streams = torch.matmul(h_res.transpose(-1, -2).type_as(hidden_streams), hidden_streams)
+        output_streams = h_post.unsqueeze(-1).type_as(x) * x.unsqueeze(-2) + residual_streams
+        return output_streams.reshape(residual_shape).type_as(x)
 
     def hc_split_sinkhorn_torch(self, weight):
         if not self.merge_layer_only_pre:
